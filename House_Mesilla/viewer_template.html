@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>House model - Mesilla, Elevation R</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 13px/1.35 -apple-system, system-ui, sans-serif; background: #dfe6ec; }
+  #panel { position: absolute; top: 12px; left: 12px; width: 250px; background: rgba(255,255,255,.93); border-radius: 10px;
+           padding: 12px 14px; box-shadow: 0 2px 12px rgba(0,0,0,.15); max-height: calc(100% - 48px); overflow: auto; }
+  #panel h1 { font-size: 15px; margin: 0 0 2px; }
+  #panel .sub { color: #666; margin-bottom: 10px; }
+  #panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #777; margin: 12px 0 6px; }
+  label.row { display: flex; align-items: center; gap: 6px; margin: 3px 0; cursor: pointer; }
+  input[type=range] { width: 100%; }
+  .btns { display: flex; flex-wrap: wrap; gap: 5px; }
+  button { border: 1px solid #c8ced4; background: #f7f9fa; border-radius: 6px; padding: 4px 8px; cursor: pointer; font: inherit; }
+  button:hover { background: #e9eef2; }
+  #info { position: absolute; right: 12px; bottom: 12px; background: rgba(255,255,255,.93); border-radius: 8px; padding: 8px 12px;
+          box-shadow: 0 2px 12px rgba(0,0,0,.15); max-width: 320px; display: none; }
+  .label { font: 600 11px -apple-system, system-ui, sans-serif; color: #223; background: rgba(255,255,255,.8);
+           padding: 1px 5px; border-radius: 4px; white-space: nowrap; pointer-events: none; }
+  #hint { position: absolute; bottom: 12px; left: 12px; color: #456; background: rgba(255,255,255,.7); padding: 4px 8px; border-radius: 6px; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="panel">
+  <h1>Mesilla, Elevation R</h1>
+  <div class="sub">2,615 sq ft &middot; 4 bed &middot; 3 bath &middot; right-handed</div>
+  <h2>Views</h2>
+  <div class="btns">
+    <button data-view="street">Street</button>
+    <button data-view="aerial">Aerial</button>
+    <button data-view="back">Back yard</button>
+    <button data-view="top">Plan</button>
+    <button data-view="doll1">Floor 1 open</button>
+    <button data-view="doll2">Floor 2 open</button>
+    <button data-view="explode">Exploded</button>
+  </div>
+  <h2>Layers</h2>
+  <div id="layers"></div>
+  <h2>Pull apart</h2>
+  <input id="explode" type="range" min="0" max="1" step="0.01" value="0">
+  <h2>Section cut height <span id="cutval"></span></h2>
+  <input id="cut" type="range" min="0" max="30" step="0.25" value="30">
+  <h2>Show</h2>
+  <label class="row"><input type="checkbox" id="lbl" checked> Room labels</label>
+  <label class="row"><input type="checkbox" id="lines" checked> Builder plan linework on floors</label>
+</div>
+<div id="info"></div>
+<div id="hint">Drag to orbit &middot; right-drag to pan &middot; scroll to zoom &middot; click a part to identify it</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+const META = __META_JSON__;
+const GLB = "__GLB_BASE64__";
+const FT = 0.3048;
+const toWorld = (x, y, z) => new THREE.Vector3(x * FT, z * FT, -y * FT);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.localClippingEnabled = true;
+renderer.shadowMap.enabled = true;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(innerWidth, innerHeight);
+Object.assign(labelRenderer.domElement.style, { position: 'absolute', top: '0', pointerEvents: 'none' });
+document.body.appendChild(labelRenderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xdfe6ec);
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 500);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8170, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(-12, 30, 18);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -30, right: 30, top: 30, bottom: -30, near: 1, far: 90 });
+sun.target.position.set(5, 0, -8);
+scene.add(sun, sun.target);
+
+// ---------------------------------------------------------------- textures
+function canvasTex(w, h, draw, repeatMeters) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 8; t.userData.meters = repeatMeters;
+  return t;
+}
+const rnd = (s => () => (s = (s * 16807) % 2147483647) / 2147483647)(7);
+function shade(hex, k) { const c = new THREE.Color(hex); c.offsetHSL(0, 0, k); return '#' + c.getHexString(); }
+const TEX = {
+  brick: base => canvasTex(512, 512, (g, w, h) => {
+    g.fillStyle = '#efe9dc'; g.fillRect(0, 0, w, h);                       // white mortar
+    const rows = 16, bh = h / rows, bw = w / 4;
+    for (let r = 0; r < rows; r++) for (let i = -1; i < 5; i++) {
+      g.fillStyle = shade(base, (rnd() - .5) * .12);
+      g.fillRect(i * bw + (r % 2) * bw / 2 + 2, r * bh + 2, bw - 4, bh - 4);
+    }
+  }, 1.3),
+  stone: base => canvasTex(512, 512, (g, w, h) => {
+    g.fillStyle = '#efe9dc'; g.fillRect(0, 0, w, h);
+    let y = 0;
+    while (y < h) {
+      const rh = 28 + rnd() * 34; let x = -rnd() * 60;
+      while (x < w) { const sw = 50 + rnd() * 110; g.fillStyle = shade(base, (rnd() - .5) * .2);
+        g.fillRect(x + 3, y + 3, sw - 6, rh - 6); x += sw; }
+      y += rh;
+    }
+  }, 1.6),
+  siding: base => canvasTex(256, 256, (g, w, h) => {
+    const n = 14, bh = h / n;
+    for (let i = 0; i < n; i++) {
+      const grd = g.createLinearGradient(0, i * bh, 0, (i + 1) * bh);
+      grd.addColorStop(0, shade(base, -.06)); grd.addColorStop(1, shade(base, .04));
+      g.fillStyle = grd; g.fillRect(0, i * bh, w, bh);
+    }
+  }, 2.0),
+  shake: base => canvasTex(256, 256, (g, w, h) => {
+    g.fillStyle = shade(base, -.08); g.fillRect(0, 0, w, h);
+    const rows = 8, bh = h / rows;
+    for (let r = 0; r < rows; r++) { let x = -rnd() * 20;
+      while (x < w) { const sw = 14 + rnd() * 22; g.fillStyle = shade(base, (rnd() - .5) * .1);
+        g.fillRect(x + 1, r * bh + 1, sw - 2, bh - 2); x += sw; } }
+  }, 1.8),
+  shingle: base => canvasTex(256, 256, (g, w, h) => {
+    g.fillStyle = shade(base, -.08); g.fillRect(0, 0, w, h);
+    const rows = 12, bh = h / rows, bw = w / 3;
+    for (let r = 0; r < rows; r++) for (let i = -1; i < 4; i++) {
+      g.fillStyle = shade(base, (rnd() - .5) * .14);
+      g.fillRect(i * bw + (r % 2) * bw / 2 + 1, r * bh + 1, bw - 2, bh - 3);
+    }
+  }, 2.0),
+  tile: base => canvasTex(512, 512, (g, w, h) => {           // 8x24 wood-look plank tile, 1/3 offset
+    g.fillStyle = '#9d968c'; g.fillRect(0, 0, w, h);
+    const rows = 8, bh = h / rows, bw = w / 2.6667;
+    for (let r = 0; r < rows; r++) for (let i = -1; i < 4; i++) {
+      const x = i * bw + (r % 3) * bw / 3; g.fillStyle = shade(base, (rnd() - .5) * .1);
+      g.fillRect(x + 1.5, r * bh + 1.5, bw - 3, bh - 3);
+      g.strokeStyle = shade(base, -.07); g.globalAlpha = .35;
+      for (let k = 0; k < 4; k++) { g.beginPath(); const yy = r * bh + 4 + rnd() * (bh - 8); g.moveTo(x + 3, yy); g.lineTo(x + bw - 3, yy + (rnd() - .5) * 4); g.stroke(); }
+      g.globalAlpha = 1;
+    }
+  }, 1.63),
+  vinyl: base => canvasTex(512, 512, (g, w, h) => {
+    g.fillStyle = shade(base, -.1); g.fillRect(0, 0, w, h);
+    const rows = 10, bh = h / rows, bw = w / 1.3;
+    for (let r = 0; r < rows; r++) { const off = rnd() * bw;
+      for (let i = -1; i < 3; i++) { g.fillStyle = shade(base, (rnd() - .5) * .1); g.fillRect(i * bw + off + 1, r * bh + 1, bw - 2, bh - 2); } }
+  }, 2.2),
+  carpet: base => canvasTex(128, 128, (g, w, h) => {
+    g.fillStyle = base; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 3000; i++) { g.fillStyle = shade(base, (rnd() - .5) * .08); g.fillRect(rnd() * w, rnd() * h, 1.5, 1.5); }
+  }, 0.6),
+  grass: base => canvasTex(256, 256, (g, w, h) => {
+    g.fillStyle = base; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 6000; i++) { g.fillStyle = shade(base, (rnd() - .5) * .14); g.fillRect(rnd() * w, rnd() * h, 1.5, 3); }
+  }, 2.5),
+};
+TEX.bath_tile = TEX.tile;
+
+// Box-project UVs in world space so textures keep real-world scale.
+function boxUV(mesh, meters) {
+  const geo = mesh.geometry.index ? mesh.geometry.toNonIndexed() : mesh.geometry;
+  geo.computeVertexNormals();
+  const pos = geo.attributes.position, nor = geo.attributes.normal, uv = new Float32Array(pos.count * 2);
+  const v = new THREE.Vector3(), n = new THREE.Vector3();
+  const nm = new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld);
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
+    n.fromBufferAttribute(nor, i).applyMatrix3(nm).normalize();
+    const ax = Math.abs(n.x), ay = Math.abs(n.y), az = Math.abs(n.z);
+    let u, w;
+    if (ay >= ax && ay >= az) { u = v.x; w = v.z; }
+    else if (ax >= az) { u = v.z; w = v.y; } else { u = v.x; w = v.y; }
+    uv[2 * i] = u / meters; uv[2 * i + 1] = w / meters;
+  }
+  geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  mesh.geometry = geo;
+}
+// Sloped roof faces: project along the slope so shingle rows follow the eave.
+function roofUV(mesh, meters) {
+  const geo = mesh.geometry.index ? mesh.geometry.toNonIndexed() : mesh.geometry;
+  geo.computeVertexNormals();
+  const pos = geo.attributes.position, nor = geo.attributes.normal, uv = new Float32Array(pos.count * 2);
+  const v = new THREE.Vector3(), n = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
+    n.fromBufferAttribute(nor, i);
+    const h = Math.hypot(n.x, n.z) || 1, dx = n.x / h, dz = n.z / h;
+    const along = -dz * v.x + dx * v.z, up = dx * v.x + dz * v.z;
+    uv[2 * i] = along / meters; uv[2 * i + 1] = (up * 1.118 - v.y * 0.0) / meters;
+  }
+  geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  mesh.geometry = geo;
+}
+
+// ---------------------------------------------------------------- load
+const clip = new THREE.Plane(new THREE.Vector3(0, -1, 0), 100);
+const layers = {}, groups = { low: [], high: [], roof: [] };
+const F2_M = META.levels.F2 * FT;
+const bytes = Uint8Array.from(atob(GLB), c => c.charCodeAt(0));
+new GLTFLoader().parse(bytes.buffer, '', gltf => {
+  const root = gltf.scene;
+  scene.add(root);
+  root.updateMatrixWorld(true);
+  const texCache = {};
+  root.traverse(o => {
+    if (!o.isMesh) return;
+    // GLTFLoader turns spaces in node names into underscores.
+    const [layer, name] = o.name.replace(/_/g, ' ').split('|');
+    o.userData.layer = layer; o.userData.part = name;
+    const mat = o.material.clone();
+    const mname = o.material.name;
+    if (TEX[mname]) {
+      texCache[mname] ??= TEX[mname]('#' + mat.color.getHexString());
+      mat.map = texCache[mname]; mat.color.set(0xffffff);
+      (mname === 'shingle' ? roofUV : boxUV)(o, texCache[mname].userData.meters);
+    }
+    mat.clippingPlanes = [clip]; mat.clipShadows = true; mat.side = THREE.DoubleSide;
+    if (mname === 'glass') { mat.transparent = true; mat.opacity = 0.35; mat.depthWrite = false; }
+    if (mname === 'light') { mat.emissive = new THREE.Color(0xffd27a); mat.emissiveIntensity = 1.2; }
+    o.material = mat;
+    o.castShadow = mname !== 'glass'; o.receiveShadow = true;
+    (layers[layer] ??= []).push(o);
+    const box = new THREE.Box3().setFromObject(o);
+    o.userData.base = o.position.clone();
+    if (layer === 'Roof') groups.roof.push(o);
+    else if (layer === 'Floor 2' || (layer !== 'Site' && layer !== 'Floor 1' && box.min.y >= F2_M - 0.31)) groups.high.push(o);
+    else if (layer !== 'Site') groups.low.push(o);
+  });
+  buildLayerUI();
+  buildLabels();
+  buildLines();
+  setView('street', false);
+  animate();
+});
+
+// ---------------------------------------------------------------- UI
+const ORDER = ['Site', 'Exterior', 'Roof', 'Floor 2', 'Floor 1', 'Furniture'];
+function buildLayerUI() {
+  const box = document.getElementById('layers');
+  for (const name of ORDER.filter(n => layers[n])) {
+    const row = document.createElement('label'); row.className = 'row';
+    row.innerHTML = `<input type="checkbox" checked data-layer="${name}"> ${name}`;
+    row.querySelector('input').onchange = e => setLayer(name, e.target.checked);
+    box.appendChild(row);
+  }
+}
+function setLayer(name, on) {
+  (layers[name] || []).forEach(o => o.visible = on);
+  const cb = document.querySelector(`input[data-layer="${name}"]`); if (cb) cb.checked = on;
+  updateOverlays();
+}
+
+const labelObjs = [], lineObjs = [];
+function buildLabels() {
+  for (const r of META.rooms) {
+    if (/Closet|Linen|Mechanical|other|Hall/.test(r.name)) continue;
+    const div = document.createElement('div'); div.className = 'label';
+    div.textContent = `${r.name} · ${Math.round(r.area_sqft)} sf`;
+    const obj = new CSS2DObject(div);
+    const z = r.floor === 1 ? 0.3 : META.levels.F2 + 0.3;
+    obj.position.copy(toWorld(r.label[0], r.label[1], z));
+    obj.userData.floor = r.floor; obj.userData.base = obj.position.clone();
+    scene.add(obj); labelObjs.push(obj);
+  }
+}
+function buildLines() {
+  for (const [floor, segs] of Object.entries(META.lines)) {
+    const z = (floor === '1' ? 0 : META.levels.F2) + 0.03;
+    const pts = [];
+    for (let i = 0; i < segs.length; i += 4) {
+      pts.push(toWorld(segs[i], segs[i + 1], z), toWorld(segs[i + 2], segs[i + 3], z));
+    }
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const line = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: 0x5a5148, transparent: true, opacity: .55, clippingPlanes: [clip] }));
+    line.userData.floor = +floor; line.userData.base = line.position.clone();
+    scene.add(line); lineObjs.push(line);
+  }
+}
+function updateOverlays() {
+  const f1 = document.querySelector('input[data-layer="Floor 1"]')?.checked ?? true;
+  const f2 = document.querySelector('input[data-layer="Floor 2"]')?.checked ?? true;
+  const showL = document.getElementById('lbl').checked, showP = document.getElementById('lines').checked;
+  const cutFt = +document.getElementById('cut').value;
+  // Labels only make sense when the house is opened up.
+  const roofOn = document.querySelector('input[data-layer="Roof"]')?.checked ?? true;
+  const open = cutFt < 30 || explodeAmt > 0.05 || !roofOn;
+  for (const o of labelObjs) {
+    const on = o.userData.floor === 1 ? f1 : f2;
+    const f2Covers = f2 && explodeAmt < 0.05 && cutFt > META.levels.F2;
+    const cutsFloor2 = o.userData.floor === 2 && cutFt <= META.levels.F2;
+    o.visible = showL && open && on && !(o.userData.floor === 1 && f2Covers) && !cutsFloor2;
+  }
+  for (const o of lineObjs) o.visible = showP && (o.userData.floor === 1 ? f1 : f2);
+}
+document.getElementById('lbl').onchange = updateOverlays;
+document.getElementById('lines').onchange = updateOverlays;
+
+let explodeAmt = 0;
+function setExplode(e) {
+  explodeAmt = e;
+  document.getElementById('explode').value = e;
+  const up2 = e * 14 * FT, upR = e * 30 * FT;
+  for (const o of groups.high) o.position.y = o.userData.base.y + up2;
+  for (const o of groups.roof) o.position.y = o.userData.base.y + upR;
+  for (const o of [...labelObjs, ...lineObjs]) if (o.userData.floor === 2) o.position.y = o.userData.base.y + up2;
+  updateOverlays();
+}
+document.getElementById('explode').oninput = e => setExplode(+e.target.value);
+function setCut(ft) {
+  document.getElementById('cut').value = ft;
+  clip.constant = ft >= 30 ? 100 : ft * FT;
+  document.getElementById('cutval').textContent = ft >= 30 ? '(off)' : `${ft.toFixed(1)} ft`;
+  updateOverlays();
+}
+document.getElementById('cut').oninput = e => setCut(+e.target.value);
+setCut(30);
+
+const C = (x, y, z) => toWorld(x, y, z);
+const VIEWS = {
+  street: { cam: C(-10, -48, 8), tgt: C(17, 20, 9), explode: 0, cut: 30, hide: [] },
+  aerial: { cam: C(-38, -40, 55), tgt: C(17, 27, 6), explode: 0, cut: 30, hide: [] },
+  back: { cam: C(55, 105, 22), tgt: C(17, 40, 8), explode: 0, cut: 30, hide: [] },
+  top: { cam: C(17, 27.01, 120), tgt: C(17, 27, 0), explode: 0, cut: 6, hide: ['Furniture'] },
+  doll1: { cam: C(-22, -18, 42), tgt: C(17, 28, 0), explode: 0, cut: 6, hide: [] },
+  doll2: { cam: C(-22, -18, 52), tgt: C(17, 28, 10), explode: 0, cut: 16, hide: [] },
+  explode: { cam: C(-45, -42, 45), tgt: C(17, 27, 16), explode: 1, cut: 30, hide: [] },
+};
+function setView(name) {
+  const v = VIEWS[name];
+  camera.position.copy(v.cam); controls.target.copy(v.tgt);
+  ORDER.forEach(l => setLayer(l, !v.hide.includes(l)));
+  setExplode(v.explode); setCut(v.cut);
+  controls.update();
+}
+document.querySelectorAll('[data-view]').forEach(b => b.onclick = () => setView(b.dataset.view));
+
+// ---------------------------------------------------------------- picking
+const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+let downAt = null;
+renderer.domElement.addEventListener('pointerdown', e => downAt = [e.clientX, e.clientY]);
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 4) return;
+  mouse.set(e.clientX / innerWidth * 2 - 1, -e.clientY / innerHeight * 2 + 1);
+  ray.setFromCamera(mouse, camera);
+  const hits = ray.intersectObjects(scene.children, true)
+    .filter(h => h.object.isMesh && h.object.visible && isShown(h.object) && clip.distanceToPoint(h.point) >= 0);
+  const info = document.getElementById('info');
+  if (!hits.length) { info.style.display = 'none'; return; }
+  const o = hits[0].object;
+  const room = META.rooms.find(r => o.userData.part === `Room: ${r.name}`);
+  info.innerHTML = `<b>${o.userData.part}</b><br>${o.userData.layer} &middot; ${o.material.name || ''}` +
+    (room ? `<br>${room.area_sqft} sq ft &middot; floor: ${room.finish}` : '');
+  info.style.display = 'block';
+});
+function isShown(o) { for (let p = o; p; p = p.parent) if (!p.visible) return false; return true; }
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight); labelRenderer.setSize(innerWidth, innerHeight);
+});
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
