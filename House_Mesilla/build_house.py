@@ -45,8 +45,12 @@ F1_SILL, F1_HEAD = 2.5, 8.0
 F2_SILL, F2_HEAD = 2.25, 6.83
 WALL_GROW = 0.05        # plan walls are drawn ~3.4"; grow to ~4.5" framed walls
 ROOF_PITCH = 6 / 12
-TOWER_PITCH = 9 / 12
+TOWER_PITCH = 5 / 12  # low enough that the tower ridge ties into the front hip below its ridge
 OVERHANG = 1.0
+ROOF_DECK = 0.35
+# Underside of the hip roofs and the garage roof: where printed pieces meet.
+ROOF_SEAT = F2_PLATE + HEEL - OVERHANG * ROOF_PITCH - ROOF_DECK
+GARAGE_SEAT = F1_PLATE + HEEL - OVERHANG * ROOF_PITCH - ROOF_DECK
 
 # ---------------------------------------------------------------- materials
 COLORS = {
@@ -56,12 +60,13 @@ COLORS = {
     "shake": "#8f8576",         # upper siding behind the garage
     "brick": "#c9b392",         # Irish Cream brick, white mortar
     "stone": "#d8c6a3",         # Buckskin Cream Chopped stone
-    "shutter": "#5f6870",       # SW 7019 Gauntlet Grey
+    "shutter": "#5b4332",       # stained wood plank shutters (owner photo)
     "front_door": "#4e4236",    # SW 3542 Charwood
     "garage_door": "#e2dccd",
     "shingle": "#6b625a",       # 3-tab composition shingles
     "gutter": "#e5decf",
     "glass": "#9fc3d6",
+    "cavity": "#3d3730",        # inside of the empty box behind the tower window
     "slab": "#bdb8ae",
     "concrete": "#c8c3b8",
     "garage_floor": "#a9a59c",
@@ -215,11 +220,44 @@ def gable_roof_y(x0, x1, y0, y1, plate, pitch, overhang=OVERHANG, back_overhang=
     return roof, gable, (ex0, ey0, ex1, ey1, z_eave, z_ridge)
 
 
+def union_meshes(meshes):
+    """One closed mesh from overlapping closed meshes (removes coplanar overlaps)."""
+    import manifold3d as mf
+    out = mf.Manifold()
+    for mesh in meshes:
+        m = mf.Mesh(vert_properties=np.asarray(mesh.vertices, dtype=np.float32), tri_verts=np.asarray(mesh.faces, dtype=np.uint32))
+        m.merge()
+        out = out + mf.Manifold(m)
+    res = out.to_mesh()
+    return trimesh.Trimesh(vertices=res.vert_properties[:, :3], faces=res.tri_verts)
+
+
+def subtract_box(mesh, bounds):
+    """Mesh minus an axis-aligned box (x0, y0, z0, x1, y1, z1)."""
+    import manifold3d as mf
+    x0, y0, z0, x1, y1, z1 = bounds
+    m = mf.Mesh(vert_properties=np.asarray(mesh.vertices, dtype=np.float32), tri_verts=np.asarray(mesh.faces, dtype=np.uint32))
+    m.merge()
+    cut = mf.Manifold(m) - mf.Manifold.cube([x1 - x0, y1 - y0, z1 - z0]).translate([x0, y0, z0])
+    out = cut.to_mesh()
+    return trimesh.Trimesh(vertices=out.vert_properties[:, :3], faces=out.tri_verts)
+
+
+def solid_to_floor(slabs, z_floor):
+    """Printable gable roof: the slabs filled down to a flat bottom."""
+    pts = np.vstack([m.vertices for m in slabs])
+    flat = pts.copy()
+    flat[:, 2] = z_floor
+    return trimesh.convex.convex_hull(np.vstack([pts, flat]))
+
+
 # ---------------------------------------------------------------- scene
 class Model:
     def __init__(self):
         self.parts = []   # (layer, name, mesh, material)
         self.solids = {}  # id(mesh) -> the closed solids it was built from
+        self.print_solids = {}  # part name -> solid used instead when printing
+        self.roof_fills = {"main": [], "garage": []}  # roof solids filled down: "under the roof"
 
     def add(self, layer, name, mesh, mat):
         solids = [m for m in (mesh if isinstance(mesh, list) else [mesh]) if m is not None]
@@ -257,6 +295,11 @@ def classify(floor, op, out):
             return "back_door"
         if not exterior and abs(cx - 15.15) < 0.4 and 33 < cy < 38.5:
             return "stair_halfwall"
+    if floor == 2 and exterior and cy < 10.5 and 8.5 < cx < 13.0:
+        # The brochure plan's second game room window, behind the stone tower.
+        # On this house the tower window opens into an empty box and the game
+        # room wall is closed.
+        return "boxed_window"
     if exterior:
         return "window"
     return "door"
@@ -336,6 +379,8 @@ def build_floor(model, floors, n):
                 build_front_door(model, o)
             elif kind == "back_door":
                 build_back_door(model, o)
+        elif kind == "boxed_window":
+            model.add(layer, "Wall Behind Tower Window", prism(g, z0, z_top), "wall")
         elif kind == "window":
             s = sill
             if n == 1 and o["rect"][1] > 54 and 26 < (x0 + x1) / 2 < 33:
@@ -450,6 +495,25 @@ def build_back_door(model, o):
     model.add("Floor 1", "Back Door Glass", cuboid(x0 + 0.35, ym - 0.02, 0.6, x1 - 0.35, ym + 0.02, DOOR_HEAD - 0.4), "glass")
 
 
+def sub_edges(coords, region=None):
+    """Ring edges, each split where it enters or leaves the region."""
+    for a, b in zip(coords, coords[1:]):
+        if region is None:
+            yield a, b
+            continue
+        edge = LineString([a, b])
+        inside = edge.intersection(region)
+        ts = {0.0, 1.0}
+        for g in getattr(inside, "geoms", [inside]):
+            if g.geom_type == "LineString" and not g.is_empty:
+                ts |= {edge.project(Point(g.coords[0]), normalized=True),
+                       edge.project(Point(g.coords[-1]), normalized=True)}
+        ts = sorted(ts)
+        for t0, t1 in zip(ts, ts[1:]):
+            if t1 - t0 > 1e-6:
+                yield edge.interpolate(t0, normalized=True).coords[0], edge.interpolate(t1, normalized=True).coords[0]
+
+
 def build_cladding(model, floors):
     """Exterior skin: brick and stone on the front, siding elsewhere."""
     skin_out, skin_in = 0.1, 0.02
@@ -461,7 +525,9 @@ def build_cladding(model, floors):
         coords = list(out.exterior.coords)
         if out.exterior.is_ccw is False:
             coords = coords[::-1]
-        for (ax, ay), (bx, by) in zip(coords, coords[1:]):
+        # Split first floor edges where the second floor ends, so the skin
+        # over the garage stops under the garage roof.
+        for (ax, ay), (bx, by) in sub_edges(coords, f2_out.buffer(0.01) if n == 1 else None):
             length = math.hypot(bx - ax, by - ay)
             if length < 0.2:
                 continue
@@ -469,17 +535,20 @@ def build_cladding(model, floors):
             nx, ny = uy, -ux  # outward normal for a CCW ring
             mx, my = (ax + bx) / 2, (ay + by) / 2
             if n == 1:
-                covered = f2_out.buffer(0.3).contains(Point(mx, my))
-                z1 = F2_FLOOR if covered else F1_PLATE + HEEL
+                covered = f2_out.buffer(0.01).contains(Point(mx, my))
+                # Under the garage roof, stop just below the roof surface: the
+                # skin stands proud of the wall where the roof has sloped down.
+                z1 = F2_FLOOR if covered else F1_PLATE + HEEL - 0.15
             else:
-                z1 = F2_PLATE + HEEL
+                z1 = F2_PLATE + HEEL - 0.15  # tucked under the roof where it slopes past the wall
             front = ny < -0.9
             if n == 1:
                 mat = "brick" if (front or max(ay, by) <= 14.6) else "siding"
             else:
                 # Game room front is brick (the tower covers its middle);
                 # the owner's suite wall above the garage roof is shake.
-                mat = "brick" if (front and max(ay, by) < 11) else ("shake" if front else "siding")
+                side_over_garage = nx > 0.9 and abs(mx - 15.0) < 0.6 and my < 19
+                mat = "brick" if ((front and max(ay, by) < 11) or side_over_garage) else ("shake" if front else "siding")
             # Openings on this edge, as intervals along it.
             cuts = []
             for o in ops:
@@ -523,7 +592,7 @@ def build_cladding(model, floors):
                                 (p1[0] - nx * skin_in, p1[1] - ny * skin_in),
                                 (p1[0] + nx * skin_out, p1[1] + ny * skin_out),
                                 (p0[0] + nx * skin_out, p0[1] + ny * skin_out)])
-                if n == 1 and front and 7.0 <= mx <= 15.0:
+                if n == 1 and front and TOWER_X0 <= mx <= TOWER_X1:
                     continue  # behind the stone tower face
                 meshes.append(prism(quad, za, zb))
             model.add("Exterior", f"Cladding {mat}", meshes, mat)
@@ -531,49 +600,74 @@ def build_cladding(model, floors):
         for x, y in coords[:-1]:
             if y < (14.6 if n == 1 else 19.0):
                 continue
-            model.add("Exterior", "Corner Trim", cylinder(x, y, z0, (F2_FLOOR if n == 1 else F2_PLATE + HEEL), 0.12, 8), "trim")
+            model.add("Exterior", "Corner Trim", cylinder(x, y, z0, (F2_FLOOR if n == 1 else F2_PLATE + HEEL - 0.2), 0.12, 8), "trim")
 
 
-def build_tower(model):
-    """Elevation R's two-story stone entry tower with the arched porch."""
-    tx0, tx1 = 7.0, 15.0
-    y_face, depth = 9.58, 0.5
+# Stone entry tower (owner's photo): about 6 ft wide, the porch arch plus a
+# stone pier on its left, rising with the second floor to the same eave.
+TOWER_X0, TOWER_X1 = 8.9, 15.0
+TOWER_FACE_Y, TOWER_DEPTH = 9.58, 0.5
+TOWER_WIN_X, TOWER_WIN_W = 11.95, 2.0
+TOWER_WIN_SILL, TOWER_WIN_HEAD = F2_FLOOR + 5.4, F2_FLOOR + 7.5
+
+
+def build_tower(model, floors):
+    """Elevation R's stone entry tower with the arched porch."""
+    tx0, tx1 = TOWER_X0, TOWER_X1
+    y_face, depth = TOWER_FACE_Y, TOWER_DEPTH
     z_top = F2_PLATE + HEEL
     face = box(tx0, GRADE, tx1, z_top)
-    entry = arch_opening(12.8, GRADE, 3.9, 7.4, 0.9)
-    window = arch_opening(10.79, F2_FLOOR + F2_SILL, 2.98, F2_FLOOR + F2_HEAD - 0.5, 0.45)
+    entry = arch_opening(12.85, GRADE, 3.9, 7.4, 0.9)
+    wx0, wx1 = TOWER_WIN_X - TOWER_WIN_W / 2, TOWER_WIN_X + TOWER_WIN_W / 2
+    window = box(wx0, TOWER_WIN_SILL, wx1, TOWER_WIN_HEAD)
     stone = face.difference(entry).difference(window)
     # Split at the second floor line so the floors can be pulled apart.
     model.add("Exterior", "Stone Tower", face_extrude(stone.intersection(box(0, -5, 40, F2_FLOOR)), y_face + depth, depth), "stone")
     model.add("Exterior", "Stone Tower Upper", face_extrude(stone.intersection(box(0, F2_FLOOR, 40, 40)), y_face + depth, depth), "stone")
-    model.add("Exterior", "Stone Arches", face_extrude(arch_ring(12.8, 7.4, 3.9, 0.9, 0.55), y_face, 0.12), "stone")
-    model.add("Exterior", "Stone Arches Upper", face_extrude(arch_ring(10.79, F2_FLOOR + F2_HEAD - 0.5, 2.98, 0.45, 0.45), y_face, 0.12), "stone")
-    # Porch side returns in brick between the tower face and the recess.
-    model.add("Exterior", "Porch Ceiling", cuboid(10.6, y_face, F1_PLATE - 0.1, 15.0, 14.2, F1_PLATE), "trim")
-    # Tower gable and its roof.
-    roof, gable, ext = gable_roof_y(tx0, tx1, y_face, 16.6, F2_PLATE, TOWER_PITCH, overhang=0.6, back_overhang=0.0)
+    # The tower window opens into an empty closed box; the game room wall
+    # behind it is solid (owner).
+    model.add("Exterior", "Tower Window Glass", face_extrude(window, y_face + 0.12, 0.04), "glass")
+    model.add("Exterior", "Tower Window Empty Box", face_extrude(window.buffer(0.05), y_face + depth + 0.02, 0.04), "cavity")
+    sash = window.difference(window.buffer(-0.1, join_style="mitre"))
+    grid = [box(wx0 + TOWER_WIN_W * k / 3 - 0.025, TOWER_WIN_SILL, wx0 + TOWER_WIN_W * k / 3 + 0.025, TOWER_WIN_HEAD) for k in (1, 2)]
+    grid += [box(wx0, TOWER_WIN_SILL + (TOWER_WIN_HEAD - TOWER_WIN_SILL) * k / 3 - 0.025, wx1,
+                 TOWER_WIN_SILL + (TOWER_WIN_HEAD - TOWER_WIN_SILL) * k / 3 + 0.025) for k in (1, 2)]
+    model.add("Exterior", "Tower Window Frame", face_extrude(unary_union([sash] + grid), y_face + 0.1, 0.08), "trim")
+    # Brick soldier arch above and a brick rowlock sill below the window.
+    model.add("Exterior", "Tower Window Arch", face_extrude(arch_ring(TOWER_WIN_X, TOWER_WIN_HEAD, TOWER_WIN_W + 0.3, 0.25, 0.45), y_face, 0.1), "brick")
+    model.add("Exterior", "Tower Window Sill", cuboid(wx0 - 0.2, y_face - 0.15, TOWER_WIN_SILL - 0.3, wx1 + 0.2, y_face + 0.1, TOWER_WIN_SILL), "brick")
+    model.add("Exterior", "Shutters Upper (tower)", [cuboid(x, y_face - 0.12, TOWER_WIN_SILL, x + 1.15, y_face, TOWER_WIN_HEAD + 0.3)
+                                                      for x in (wx0 - 1.3, wx1 + 0.15)], "shutter")
+    # Brick soldier arch over the porch opening, with a keystone.
+    model.add("Exterior", "Entry Brick Arch", [face_extrude(arch_ring(12.85, 7.4, 3.9, 0.9, 0.85), y_face, 0.1),
+                                               face_extrude(box(12.6, 8.35, 13.1, 9.35), y_face, 0.14)], "brick")
+    model.add("Exterior", "Porch Ceiling", cuboid(10.6, y_face + depth, F1_PLATE - 0.1, 15.0, 14.2, F1_PLATE), "trim")
+    # Tower gable and its roof: a front gable whose ridge ties into the front
+    # slope of the game room hip like a dormer (valleys drain to the front).
+    ridge = F2_PLATE + HEEL + (tx1 - tx0) / 2 * TOWER_PITCH
+    arm_eave_y = 10.06 - OVERHANG
+    main_eave_z = F2_PLATE + HEEL - OVERHANG * ROOF_PITCH
+    y_back = arm_eave_y + (ridge - main_eave_z) / ROOF_PITCH + 0.5
+    roof, gable, ext = gable_roof_y(tx0, tx1, y_face, y_back, F2_PLATE, TOWER_PITCH, overhang=0.6, back_overhang=0.0)
     model.add("Roof", "Tower Gable Roof", roof, "shingle")
+    model.print_solids["Tower Gable Roof"] = solid_to_floor(roof, ROOF_SEAT)
+    model.roof_fills["main"].append(solid_to_floor(roof, -20))
     model.add("Roof", "Tower Gable", face_extrude(gable, y_face + depth, depth), "stone")
-    model.add("Roof", "Tower Rake Trim", [face_extrude(Polygon([(tx0 - 0.6, F2_PLATE + HEEL - 0.45), (11.0, ext[5] - 0.05),
+    xm = (tx0 + tx1) / 2
+    model.add("Roof", "Tower Rake Trim", [face_extrude(Polygon([(tx0 - 0.6, F2_PLATE + HEEL - 0.45), (xm, ext[5] - 0.05),
                                                                  (tx1 + 0.6, F2_PLATE + HEEL - 0.45), (tx1 + 0.6, F2_PLATE + HEEL - 0.9),
-                                                                 (11.0, ext[5] - 0.5), (tx0 - 0.6, F2_PLATE + HEEL - 0.9)]),
+                                                                 (xm, ext[5] - 0.5), (tx0 - 0.6, F2_PLATE + HEEL - 0.9)]),
                                                         y_face - 0.6 + 0.01, 0.15)], "trim")
-    # Shutters beside the tower window and the stacked left-block windows.
-    sh = []
-    for xc, zlo, zhi, half in ((10.79, F2_FLOOR + F2_SILL, F2_FLOOR + F2_HEAD - 0.5, 1.49),):
-        for side in (-1, 1):
-            xa = xc + side * (half + 0.15)
-            sh.append(cuboid(xa, y_face - 0.12, zlo, xa + side * 1.3, y_face, zhi))
-    model.add("Exterior", "Shutters", sh, "shutter")
 
 
 def build_front_details(model, floors):
-    sh = []
-    # Study window (F1) and game room window above it, both with shutters.
-    for (x0, x1, zlo, zhi, yf) in ((3.75, 6.74, F1_SILL, F1_HEAD, 10.08), (3.01, 5.99, F2_FLOOR + F2_SILL, F2_FLOOR + F2_HEAD, 10.06)):
-        for side, xa in ((-1, x0 - 0.15), (1, x1 + 0.15)):
-            sh.append(cuboid(xa, yf - 0.22, zlo, xa + side * 1.3, yf - 0.1, zhi))
-    model.add("Exterior", "Shutters", sh, "shutter")
+    # Study window (F1) and game room window above it, both with shutters;
+    # separate parts so the upper pair moves with floor 2 when pulled apart.
+    for name, (x0, x1, zlo, zhi, yf) in (("Shutters", (3.75, 6.74, F1_SILL, F1_HEAD, 10.08)),
+                                         ("Shutters Upper", (3.01, 5.99, F2_FLOOR + F2_SILL, F2_FLOOR + F2_HEAD, 10.06))):
+        sh = [cuboid(xa, yf - 0.22, zlo, xa + side * 1.3, yf - 0.1, zhi)
+              for side, xa in ((-1, x0 - 0.15), (1, x1 + 0.15))]
+        model.add("Exterior", name, sh, "shutter")
     # Brick soldier arches: over the study window and across the garage.
     model.add("Exterior", "Brick Arches", [face_extrude(arch_ring(5.245, F1_HEAD, 3.6, 0.55, 0.45), -0.0 + 10.08 - 0.1, 0.14),
                                            face_extrude(arch_ring(24.5, 7.45, 17.2, 1.0, 0.55), -0.1, 0.14)], "brick")
@@ -581,27 +675,53 @@ def build_front_details(model, floors):
     model.add("Exterior", "Window Sills", [cuboid(3.6, 9.8, F1_SILL - 0.3, 6.9, 10.1, F1_SILL)], "brick")
 
 
+def f2_front(floors):
+    """Outer face of the second floor's front wall above the garage."""
+    return min(y for x, y in floors[2]["outline"].exterior.coords if x > 15.5)
+
+
 def build_roofs(model, floors):
-    # Main hip over the second floor (behind the garage line), the front hip
-    # over the game room, and the garage gable facing the street.
-    main, ext_a = hip_roof(0.0, 18.42, 34.0, 54.5, F2_PLATE, ROOF_PITCH)
-    model.add("Roof", "Main Hip Roof", main, "shingle")
-    front, ext_b = hip_roof(0.0, 10.06, 15.0, 34.0, F2_PLATE, ROOF_PITCH)
-    model.add("Roof", "Front Hip Roof", front, "shingle")
-    garage, gable, ext_g = gable_roof_y(15.0, 34.0, 0.0, 18.42, F1_PLATE, ROOF_PITCH, back_overhang=0.0)
+    # Second floor roof: the standard hip roof of the L-shaped footprint (its
+    # straight skeleton), built as the hips of the two maximal rectangles of
+    # the L and merged into one surface. Every face drains to an eave; the only
+    # valley runs from the ridge down to the inside corner above the garage.
+    # The tower gable ties into the front slope of the game room arm.
+    f2y = f2_front(floors)
+    body_hip, _ = hip_roof(0.0, f2y, 34.0, 54.5, F2_PLATE, ROOF_PITCH)
+    arm_hip, _ = hip_roof(0.0, 10.06, 15.0, 54.5, F2_PLATE, ROOF_PITCH)
+    model.roof_fills["main"] += [solid_to_floor([body_hip], -20), solid_to_floor([arm_hip], -20)]
+    # The arm's eave dies into the sides of the stone tower.
+    arm_hip = subtract_box(arm_hip, (TOWER_X0, -5, -5, TOWER_X1 + 2, TOWER_FACE_Y + TOWER_DEPTH + 0.02, 60))
+    tower = [p for p in model.parts if p[1] == "Tower Gable Roof"]
+    for p in tower:
+        model.parts.remove(p)
+    pieces = [body_hip, arm_hip] + [m for p in tower for m in model.solids[id(p[2])]]
+    model.add("Roof", "Main Roof", union_meshes(pieces), "shingle")
+    # Eave line of the whole second floor roof (overhang outline).
+    o = OVERHANG
+    eave = [(-o, 9.06), (TOWER_X0, 9.06), (TOWER_X1 + o, TOWER_FACE_Y + TOWER_DEPTH),
+            (15.0 + o, f2y - o), (34.0 + o, f2y - o), (34.0 + o, 54.5 + o), (-o, 54.5 + o), (-o, 9.06)]
+    z_eave = F2_PLATE + HEEL - OVERHANG * ROOF_PITCH
+    garage, gable, ext_g = gable_roof_y(15.0, 34.0, 0.0, f2y, F1_PLATE, ROOF_PITCH, back_overhang=0.0)
+    # The garage roof's left side dies into the stone tower and the two-story
+    # game room wall (x = 15); it only overhangs in front of the tower.
+    into_wall = (13.0, TOWER_FACE_Y, -30, 15.0, 60, 60)
+    model.print_solids["Garage Gable Roof"] = subtract_box(solid_to_floor(garage, GARAGE_SEAT), into_wall)
+    model.roof_fills["garage"].append(subtract_box(solid_to_floor(garage, -20), into_wall))
+    garage = [subtract_box(sl, into_wall) for sl in garage]
     model.add("Roof", "Garage Gable Roof", garage, "shingle")
     model.add("Roof", "Garage Gable (brick)", face_extrude(gable, 0.0, 0.1), "brick")
     # Fascia and gutters (whole-house gutters, option 63813) along the eaves.
     gut = []
-    for ex0, ey0, ex1, ey1, ze in (ext_a[:5], ext_b[:5]):
-        for (a, b) in (((ex0, ey0), (ex1, ey0)), ((ex1, ey0), (ex1, ey1)), ((ex1, ey1), (ex0, ey1)), ((ex0, ey1), (ex0, ey0))):
-            line = LineString([a, b])
-            if ex0 < 1 and ey0 > 18 and a[1] == ey0 and b[1] == ey0:
-                line = LineString([(15.0 + OVERHANG, ey0), (ex1, ey0)])  # front of main hip: only east of the front hip
-            gut.append(prism(line.buffer(0.22, cap_style="flat"), ze - 0.45, ze))
+    runs = [eave[0:2], [(TOWER_X1 + o, TOWER_FACE_Y + TOWER_DEPTH), (15.0 + o, f2y - o), (34.0 + o, f2y - o),
+                        (34.0 + o, 54.5 + o), (-o, 54.5 + o), (-o, 9.06)]]
+    # The tower side of the arm eave runs straight back along x = 16.
+    runs[1][0] = (15.0 + o, TOWER_FACE_Y + TOWER_DEPTH)
+    for run in runs:
+        gut.append(prism(LineString(run).buffer(0.22, cap_style="flat", join_style="mitre"), z_eave - 0.45, z_eave))
     ex0, ey0, ex1, ey1, ze, zr = ext_g
-    for x in (ex0, ex1):
-        gut.append(prism(LineString([(x, ey0), (x, ey1)]).buffer(0.22, cap_style="flat"), ze - 0.45, ze))
+    for x, y_end in ((ex0, TOWER_FACE_Y), (ex1, ey1)):
+        gut.append(prism(LineString([(x, ey0), (x, y_end)]).buffer(0.22, cap_style="flat"), ze - 0.45, ze))
     model.add("Roof", "Gutters", gut, "gutter")
     spouts = [(-0.4, 54.9), (34.4, 54.9), (-0.4, 10.5), (34.4, 0.4), (14.6, 0.4)]
     for x, y in spouts:
@@ -609,6 +729,68 @@ def build_roofs(model, floors):
         model.add("Exterior", "Downspouts", cuboid(x - 0.12, y - 0.12, GRADE, x + 0.12, y + 0.12, min(top, F2_FLOOR)), "gutter")
         if top > F2_FLOOR:
             model.add("Exterior", "Downspouts Upper", cuboid(x - 0.12, y - 0.12, F2_FLOOR, x + 0.12, y + 0.12, top), "gutter")
+
+
+def clip_to_roofs(model):
+    """Cut every wall, skin, trim and fixture back to the underside of the
+    roof above it, so nothing can show through a roof surface.
+
+    "Above the roof" is the roof's footprint (with overhang) minus the roof
+    solids filled down to the ground. The main roof clips the second floor and
+    the exterior; the garage roof clips first floor exterior parts only, so the
+    two-story walls rising behind the garage roof are left whole.
+    """
+    import manifold3d as mf
+
+    def to_m(mesh):
+        m = mf.Mesh(vert_properties=np.asarray(mesh.vertices, dtype=np.float32), tri_verts=np.asarray(mesh.faces, dtype=np.uint32))
+        m.merge()
+        return mf.Manifold(m)
+
+    def above(fills):
+        under = mf.Manifold()
+        for f in fills:
+            under = under + to_m(f)
+        out = under.to_mesh().vert_properties
+        x0, y0 = out[:, 0].min() - 0.01, out[:, 1].min() - 0.01
+        x1, y1 = out[:, 0].max() + 0.01, out[:, 1].max() + 0.01
+        # The roof's footprint is the fill's own shadow, extruded to the sky.
+        footprint = mf.Manifold.extrude(under.project(), 140).translate([0, 0, -20])
+        return footprint - under, (x0, y0, x1, y1)
+
+    keep_names = ("Tower Gable", "Tower Rake Trim")
+    for key, layers, max_z0 in (("main", ("Floor 2", "Exterior", "Furniture"), None),
+                               ("garage", ("Floor 1", "Exterior"), F2_FLOOR - 0.01)):
+        cutter, (bx0, by0, bx1, by1) = above(model.roof_fills[key])
+        for i, (layer, name, mesh, mat) in enumerate(model.parts):
+            if layer not in layers or name in keep_names:
+                continue
+            (mx0, my0, mz0), (mx1, my1, mz1) = mesh.bounds
+            if mx1 < bx0 or mx0 > bx1 or my1 < by0 or my0 > by1 or mz1 < 8.0:
+                continue
+            if max_z0 is not None and mz0 > max_z0:
+                continue  # second floor parts are not clipped by the garage roof
+            new_solids = []
+            changed = False
+            for p in model.solids.get(id(mesh), [mesh]):
+                m = to_m(p)
+                cut = m - cutter
+                if abs(cut.volume() - m.volume()) > 1e-6:
+                    changed = True
+                if cut.is_empty():
+                    continue
+                o = cut.to_mesh()
+                new_solids.append(trimesh.Trimesh(vertices=o.vert_properties[:, :3], faces=o.tri_verts))
+            if not changed:
+                continue
+            del model.solids[id(mesh)]
+            if not new_solids:
+                model.parts[i] = None
+                continue
+            merged = trimesh.util.concatenate(new_solids) if len(new_solids) > 1 else new_solids[0]
+            model.solids[id(merged)] = new_solids
+            model.parts[i] = (layer, name, merged, mat)
+        model.parts = [p for p in model.parts if p is not None]
 
 
 def build_stairs(model):
@@ -627,9 +809,9 @@ def build_stairs(model):
     guard = [(15.12, 25.75, 15.3, 38.55), (15.12, 38.37, 18.95, 38.55)]
     model.add("Floor 2", "Stair Guard", [cuboid(x0, y0, F2_FLOOR, x1, y1, F2_FLOOR + 2.9) for x0, y0, x1, y1 in guard], "trim")
     model.add("Floor 2", "Stair Guard Cap", [cuboid(x0 - 0.04, y0, F2_FLOOR + 2.9, x1 + 0.04, y1, F2_FLOOR + 3.05) for x0, y0, x1, y1 in guard], "rail")
-    # Handrail along the open side.
+    # Handrail on the wall side of the stairs.
     model.add("Floor 1", "Handrail", trimesh.creation.cylinder(
-        radius=0.08, segment=[[15.25, y_bot, 3.0], [15.25, y_top, F2_FLOOR + 3.0]]), "rail")
+        radius=0.08, segment=[[18.7, y_bot, 3.0], [18.7, y_top, F2_FLOOR + 3.0]]), "rail")
 
 
 def build_kitchen(model):
@@ -696,25 +878,54 @@ def toilet(model, layer, x, y, z, facing):
 def build_furniture(model):
     """Furniture the purchase records name; placement is a guess."""
     F1, F2, z2 = "Furniture", "Furniture", F2_FLOOR
-    # Great room: Rooms To Go Sandia Heights gray sofa + loveseat, Slater black tables.
-    model.add(F1, "Sofa (Sandia Heights)", [cuboid(0.5, 39.5, 0, 3.6, 47.0, 1.5), cuboid(0.5, 39.5, 1.5, 1.3, 47.0, 3.0),
-                                            cuboid(0.5, 39.5, 1.5, 3.6, 40.2, 2.1), cuboid(0.5, 46.3, 1.5, 3.6, 47.0, 2.1)], "furniture_gray")
-    model.add(F1, "Loveseat", [cuboid(2.5, 50.5, 0, 8.0, 53.6, 1.5), cuboid(2.5, 52.8, 1.5, 8.0, 53.6, 3.0)], "furniture_gray")
-    model.add(F1, "Cocktail Table (Slater)", cuboid(5.0, 42.0, 0, 7.5, 46.0, 1.5), "furniture_black")
-    # Dining: San Luis oak 5-piece rectangle table.
-    model.add(F1, "Dining Table (San Luis)", [cuboid(4.9, 27.4, 2.3, 8.3, 32.6, 2.5),
-                                              cuboid(6.4, 28.0, 0, 6.8, 32.0, 2.3)], "furniture_oak")
+    # Great room: TV on the left wall; the Sandia Heights gray sofa faces it
+    # with its back to the kitchen, and the loveseat sits under the back windows.
+    model.add(F1, "Sofa (Sandia Heights)", [cuboid(10.2, 44.5, 0, 13.3, 52.0, 1.5), cuboid(12.5, 44.5, 1.5, 13.3, 52.0, 3.0),
+                                            cuboid(10.2, 44.5, 1.5, 13.3, 45.2, 2.1), cuboid(10.2, 51.3, 1.5, 13.3, 52.0, 2.1)], "furniture_gray")
+    model.add(F1, "Loveseat", [cuboid(3.5, 50.9, 0, 9.5, 54.0, 1.5), cuboid(3.5, 53.2, 1.5, 9.5, 54.0, 3.0),
+                               cuboid(3.5, 50.9, 1.5, 4.2, 54.0, 2.1), cuboid(8.8, 50.9, 1.5, 9.5, 54.0, 2.1)], "furniture_gray")
+    model.add(F1, "Cocktail Table (Slater)", cuboid(5.5, 45.4, 0, 8.0, 49.4, 1.5), "furniture_black")
+    tv_stand(model, F1, "Great Room TV", "x", 0.3, 48.25, 0.0, 1)
+    # Dining: a long table running front to back (length is an estimate).
+    t_x0, t_x1, t_y0, t_y1 = 5.0, 8.5, 26.0, 36.0
+    model.add(F1, "Dining Table (long)", [cuboid(t_x0, t_y0, 2.3, t_x1, t_y1, 2.5)] +
+              [cuboid(x, y, 0, x + 0.3, y + 0.3, 2.3) for x in (t_x0 + 0.2, t_x1 - 0.5) for y in (t_y0 + 0.3, t_y1 - 0.6)],
+              "furniture_oak")
     chairs = []
-    for x, y in ((4.0, 28.6), (4.0, 30.6), (9.2, 28.6), (9.2, 30.6)):
-        chairs += [cuboid(x - 0.75, y, 0, x + 0.75, y + 1.5, 1.5)]
-        back = x - 0.75 if x < 6 else x + 0.6
-        chairs += [cuboid(back, y, 1.5, back + 0.15, y + 1.5, 3.3)]
+    for y in (27.0, 29.6, 32.2, 34.8):
+        for x, back in ((t_x0 - 0.9, t_x0 - 1.65), (t_x1 + 0.9, t_x1 + 1.5)):
+            chairs += [cuboid(x - 0.75, y - 0.75, 0, x + 0.75, y + 0.75, 1.5),
+                       cuboid(back, y - 0.75, 1.5, back + 0.15, y + 0.75, 3.3)]
+    for y, back in ((t_y0 - 0.9, t_y0 - 1.65), (t_y1 + 0.9, t_y1 + 1.5)):
+        cx = (t_x0 + t_x1) / 2
+        chairs += [cuboid(cx - 0.75, y - 0.75, 0, cx + 0.75, y + 0.75, 1.5),
+                   cuboid(cx - 0.75, back, 1.5, cx + 0.75, back + 0.15, 3.3)]
     model.add(F1, "Dining Chairs", chairs, "furniture_oak")
-    # Game room: Living Spaces Kerri charcoal 2-piece sectional with chaise, Harland ottoman.
-    model.add(F2, "Sectional (Kerri)", [cuboid(0.5, 11.0, z2, 3.6, 20.5, z2 + 1.5), cuboid(0.5, 11.0, z2 + 1.5, 1.3, 20.5, z2 + 3.0),
-                                         cuboid(0.5, 20.5, z2, 8.0, 23.6, z2 + 1.5), cuboid(0.5, 22.8, z2 + 1.5, 8.0, 23.6, z2 + 3.0),
-                                         cuboid(3.6, 11.0, z2, 6.2, 16.0, z2 + 1.5)], "furniture_charcoal")
-    model.add(F2, "Ottoman (Harland)", cuboid(6.2, 15.5, z2, 8.7, 18.0, z2 + 1.4), "furniture_gray")
+    # Game room: Kerri charcoal sectional along the left wall and under the
+    # front windows, facing the TV on the bedroom 3 wall.
+    model.add(F2, "Sectional (Kerri)", [cuboid(0.4, 10.5, z2, 3.5, 19.5, z2 + 1.5), cuboid(0.4, 10.5, z2 + 1.5, 1.2, 19.5, z2 + 3.0),
+                                         cuboid(3.5, 10.5, z2, 11.0, 13.6, z2 + 1.5), cuboid(3.5, 10.5, z2 + 1.5, 11.0, 11.3, z2 + 2.6),
+                                         cuboid(10.3, 13.6, z2, 13.4, 18.6, z2 + 1.5)], "furniture_charcoal")
+    tv_stand(model, F2, "Game Room TV", "y", 24.15, 6.5, z2, -1)
+    # Owner's suite: headboard on the outside wall, TV on the stair-side wall.
+    model.add(F2, "Bed (king)", [cuboid(26.9, 24.3, z2, 33.6, 30.7, z2 + 1.0), cuboid(33.4, 24.0, z2, 33.7, 31.0, z2 + 4.5)], "furniture_oak")
+    model.add(F2, "Bedding", cuboid(27.0, 24.4, z2 + 1.0, 33.4, 30.6, z2 + 2.1), "fixture")
+    model.add(F2, "Nightstands", [cuboid(32.0, 22.2, z2, 33.6, 23.8, z2 + 2.2), cuboid(32.0, 31.2, z2, 33.6, 32.8, z2 + 2.2)], "furniture_oak")
+    tv_stand(model, F2, "Owner's Suite TV", "x", 19.15, 27.5, z2, 1)
+    model.add(F2, "Ottoman (Harland)", cuboid(5.5, 16.5, z2, 8.0, 19.0, z2 + 1.4), "furniture_gray")
+
+
+def tv_stand(model, layer, name, wall_axis, wall, center, z, d):
+    """Media console and a 65 in TV against a wall. wall_axis is the axis the
+    wall's face position is measured on; d (+1/-1) points into the room."""
+    if wall_axis == "x":
+        console = cuboid(wall, center - 3.0, z, wall + d * 1.5, center + 3.0, z + 2.0)
+        tv = cuboid(wall + d * 0.3, center - 2.4, z + 2.6, wall + d * 0.45, center + 2.4, z + 5.4)
+    else:
+        console = cuboid(center - 3.0, wall, z, center + 3.0, wall + d * 1.5, z + 2.0)
+        tv = cuboid(center - 2.4, wall + d * 0.3, z + 2.6, center + 2.4, wall + d * 0.45, z + 5.4)
+    model.add("Furniture", f"{name} Console", console, "furniture_oak")
+    model.add("Furniture", name, tv, "furniture_black")
 
 
 def build_site(model):
@@ -732,9 +943,21 @@ def build_site(model):
     model.add(L, "Street", prism(box(-30, -75.0, 64.5, -41.6), GRADE - 0.6, GRADE - 0.25), "road")
     model.add(L, "AC Condenser", [cuboid(35.0, 16.3, GRADE, 37.6, 18.9, GRADE + 0.25), cuboid(35.2, 16.5, GRADE + 0.25, 37.4, 18.7, GRADE + 3.0)], "ac")
     # Stained wood fence: back lot line, both sides, returning to the house.
-    fence_lines = [[(-6.5, 44.0), (-6.5, 115.2), (40.5, 115.2), (40.5, 44.0)], [(-6.5, 44.0), (0.0, 44.0)], [(34.0, 44.0), (40.5, 44.0)]]
+    # The garage-side return has the back gate (4 ft, position approximate).
+    gate_x0, gate_x1, fy = 35.5, 39.5, 44.0
+    fence_lines = [[(-6.5, fy), (-6.5, 115.2), (40.5, 115.2), (40.5, fy)], [(-6.5, fy), (0.0, fy)],
+                   [(34.0, fy), (gate_x0, fy)], [(gate_x1, fy), (40.5, fy)]]
     fence = [prism(LineString(f).buffer(0.08, cap_style="flat", join_style="mitre"), GRADE, GRADE + 6.0) for f in fence_lines]
     model.add(L, "Wood Fence (approx.)", fence, "fence")
+    posts = [cuboid(x - 0.2, fy - 0.2, GRADE, x + 0.2, fy + 0.2, GRADE + 6.4) for x in (gate_x0, gate_x1)]
+    gate = [cuboid(gate_x0 + 0.25, fy - 0.06, GRADE + 0.3, gate_x1 - 0.25, fy + 0.06, GRADE + 6.0),
+            cuboid(gate_x0 + 0.25, fy - 0.16, GRADE + 0.6, gate_x1 - 0.25, fy - 0.06, GRADE + 0.95),
+            cuboid(gate_x0 + 0.25, fy - 0.16, GRADE + 5.2, gate_x1 - 0.25, fy - 0.06, GRADE + 5.55),
+            trimesh.creation.box(extents=[0.3, 0.1, 5.4], transform=trimesh.transformations.compose_matrix(
+                angles=[0, math.atan2(gate_x1 - gate_x0 - 0.5, 4.6), 0],
+                translate=[(gate_x0 + gate_x1) / 2, fy - 0.11, GRADE + 3.07]))]
+    model.add(L, "Back Gate", posts + gate, "fence")
+    model.add(L, "Back Gate Latch", cuboid(gate_x1 - 0.55, fy - 0.25, GRADE + 3.5, gate_x1 - 0.35, fy - 0.1, GRADE + 3.9), "furniture_black")
 
 
 # ---------------------------------------------------------------- outputs
@@ -754,63 +977,147 @@ def export_glb(model, path):
     scene.export(path)
 
 
-PRINT_PIECES = {
-    "1_first_floor": ["Floor 1"],
-    "2_second_floor": ["Floor 2"],
-    "3_roof_main": ["Main Hip Roof", "Front Hip Roof", "Tower Gable Roof", "Tower Gable"],
-    "4_roof_garage": ["Garage Gable Roof", "Garage Gable (brick)"],
-}
+# ---------------------------------------------------------------- printing
+# Pieces stack: first floor -> second floor -> main roof, and the garage roof
+# on the first floor. Pins rise from the top of each lower piece into blind
+# holes in the underside of the piece above, so every piece prints flat side
+# down with no supports. Sizes in mm at print scale.
+PIN_D, PIN_H, PIN_CHAMFER = 2.0, 2.5, 0.4
+HOLE_D, HOLE_H = 2.4, 3.0           # 0.2 mm clearance all round, 0.5 mm extra depth
+BOSS_MM = 4.4                        # pin post in a room corner, full wall height
+EAR_D, EAR_H = 10.0, 0.4             # "mouse ear" adhesion tabs, two layers thick
+EAR_SPACING = 14.0
+
+# Pin positions (ft): inside corners of the outside walls, away from windows.
+PINS_F1_TO_F2 = [(0.85, 53.65), (33.15, 53.65), (0.85, 10.95), (33.15, 19.4)]
+PINS_F2_TO_ROOF = [(0.85, 53.65), (33.15, 53.65), (0.85, 10.95), (33.15, 19.05)]
+PINS_GARAGE_ROOF = [(15.85, 0.85), (33.15, 0.85)]
+
 PRINT_SKIP = ("Windows", "Glass", "Room:", "Light Glow", "Coach", "Handrail", "Hardware", "Window Frames", "Sills",
               "Shutters", "Trim", "Toilets", "Tub", "Vanity", "Washer", "Dryer", "Furnace", "Water Heater",
-              "Refrigerator", "Range", "Microwave", "Sink", "Dishwasher", "Shower", "Linen Wall", "Garage Door Panels")
+              "Refrigerator", "Range", "Microwave", "Sink", "Dishwasher", "Shower", "Linen Wall", "Garage Door Panels",
+              "Upper Cabinets")  # wall-hung uppers would need supports
 
 
 def export_print(model, floors, folder):
     import manifold3d as mf
     folder.mkdir(exist_ok=True)
-    s = FT * 1000 / PRINT_SCALE
-    report = {}
-    for piece, keys in PRINT_PIECES.items():
-        meshes = []
-        for layer, name, mesh, mat in model.parts:
-            if layer in keys or name in keys:
-                if any(k in name for k in PRINT_SKIP) and name not in keys:
-                    continue
-                meshes.append(mesh)
-        if piece == "1_first_floor":
-            # Brick/siding skin belongs to the walls it covers.
-            meshes += [m for l, nm, m, _ in model.parts if l == "Exterior" and nm.startswith("Cladding") and m.bounds[0][2] < F1_PLATE]
-            meshes += [m for l, nm, m, _ in model.parts if nm in ("Stone Tower",)]
-        if piece == "2_second_floor":
-            meshes += [m for l, nm, m, _ in model.parts if l == "Exterior" and nm.startswith("Cladding") and m.bounds[0][2] >= F2_FLOOR - 0.01]
-        result = None
-        skipped = 0
+    s = FT * 1000 / PRINT_SCALE      # mm per ft at print scale
+    mm = 1 / s                       # ft per mm
+    big = 400.0
+    skipped = []
+
+    def to_manifold(p):
+        mesh = mf.Mesh(vert_properties=np.asarray(p.vertices, dtype=np.float32),
+                       tri_verts=np.asarray(p.faces, dtype=np.uint32))
+        mesh.merge()
+        man = mf.Manifold(mesh)
+        if man.status() != mf.Error.NoError:
+            skipped.append(p)
+            return None
+        return man
+
+    def union(meshes):
+        result = mf.Manifold()
         for m in meshes:
-            # Union the closed solids each part was built from.
             for p in model.solids.get(id(m), [m]):
-                mesh = mf.Mesh(vert_properties=np.asarray(p.vertices, dtype=np.float32),
-                               tri_verts=np.asarray(p.faces, dtype=np.uint32))
-                mesh.merge()
-                man = mf.Manifold(mesh)
-                if man.status() != mf.Error.NoError:
-                    skipped += 1
+                man = to_manifold(p)
+                if man is not None:
+                    result = result + man
+        return result
+
+    def parts(test):
+        return [m for layer, name, m, _ in model.parts if test(layer, name) and not any(k in name for k in PRINT_SKIP)]
+
+    def zband(z0, z1):
+        return mf.Manifold.cube([big, big, z1 - z0]).translate([-big / 2, -big / 2, z0])
+
+    def prism_m(poly, z0, z1):
+        return to_manifold(prism(poly, z0, z1))
+
+    def pins(points, z):
+        r, c = PIN_D / 2 * mm, PIN_CHAMFER * mm
+        out = mf.Manifold()
+        for x, y in points:
+            shaft = mf.Manifold.cylinder(PIN_H * mm - c, r, r, 48).translate([x, y, z])
+            tip = mf.Manifold.cylinder(c, r, r - c, 48).translate([x, y, z + PIN_H * mm - c])
+            out = out + shaft + tip
+        return out
+
+    def holes(points, z):
+        r = HOLE_D / 2 * mm
+        out = mf.Manifold()
+        for x, y in points:
+            out = out + mf.Manifold.cylinder(HOLE_H * mm + 0.02, r, r, 48).translate([x, y, z - 0.02])
+        return out
+
+    def bosses(points, z0, z1):
+        h = BOSS_MM / 2 * mm
+        out = mf.Manifold()
+        for x, y in points:
+            out = out + mf.Manifold.cube([2 * h, 2 * h, z1 - z0]).translate([x - h, y - h, z0])
+        return out
+
+    def ears(piece):
+        """Thin snap-off discs under the outside corners of the first layer."""
+        z0 = float(piece.to_mesh().vert_properties[:, 2].min())
+        rings = piece.slice(z0 + 0.02).to_polygons()
+        r = EAR_D / 2 * mm
+        placed, out = [], mf.Manifold()
+        for ring in rings:
+            poly = Polygon(ring)
+            if poly.area < (20 * mm) ** 2:
+                continue
+            poly = poly.simplify(0.3 * mm * 3)
+            if not poly.exterior.is_ccw:
+                poly = Polygon(list(poly.exterior.coords)[::-1])
+            pts = list(poly.exterior.coords)[:-1]
+            for i, (x, y) in enumerate(pts):
+                (ax, ay), (bx, by) = pts[i - 1], pts[(i + 1) % len(pts)]
+                cross = (x - ax) * (by - y) - (y - ay) * (bx - x)
+                if cross <= 0:  # concave corner
                     continue
-                if man.is_empty():
+                if any(math.hypot(x - px, y - py) < EAR_SPACING * mm for px, py in placed):
                     continue
-                result = man if result is None else result + man
-        if result is None:
-            continue
-        if piece == "1_first_floor":
-            # Cut the tower down to the first-floor top so floor 2 sits flat.
-            result = result ^ mf.Manifold.cube([200, 200, F2_FLOOR + 1.67]).translate([-50, -50, -1.67])
-        if piece == "2_second_floor":
-            result = result ^ mf.Manifold.cube([200, 200, 30]).translate([-50, -50, F1_PLATE])
-        out = result.to_mesh()
+                placed.append((x, y))
+                out = out + mf.Manifold.cylinder(EAR_H * mm, r, r, 48).translate([x, y, z0])
+        return out, len(placed)
+
+    is_f1 = lambda l, n: l == "Floor 1"
+    is_f2 = lambda l, n: l == "Floor 2"
+    is_skin = lambda l, n: l == "Exterior" and (n.startswith("Cladding") or n.startswith("Stone Tower"))
+
+    # 1: everything up to the first floor plate; the garage walls stop at the
+    # garage roof's underside.
+    p1 = union(parts(is_f1) + parts(is_skin)) ^ zband(-5, F1_PLATE)
+    p1 = p1 - prism_m(box(15.0, -5, 45, f2_front(floors)), GARAGE_SEAT, 30)
+    p1 = p1 + bosses(PINS_F1_TO_F2, 0, F1_PLATE) + bosses(PINS_GARAGE_ROOF, 0, GARAGE_SEAT)
+    p1 = p1 + pins(PINS_F1_TO_F2, F1_PLATE) + pins(PINS_GARAGE_ROOF, GARAGE_SEAT)
+
+    # 2: from the first floor plate to the main roof's underside, inside the
+    # second floor footprint (plus the stone tower face).
+    keep = unary_union([floors[2]["outline"].buffer(0.15, join_style="mitre"), box(6.9, 9.4, 15.1, 10.2)])
+    p2 = union(parts(is_f2) + parts(is_skin)) ^ zband(F1_PLATE, ROOF_SEAT) ^ prism_m(keep, F1_PLATE - 1, ROOF_SEAT + 1)
+    p2 = p2 + bosses(PINS_F2_TO_ROOF, F2_FLOOR - 0.01, ROOF_SEAT) + pins(PINS_F2_TO_ROOF, ROOF_SEAT)
+    p2 = p2 - holes(PINS_F1_TO_F2, F1_PLATE)
+
+    # 3 and 4: roofs, filled to a flat underside.
+    named = {name: m for _, name, m, _ in model.parts}
+    p3 = union([named["Main Roof"], model.print_solids["Tower Gable Roof"]])
+    p3 = (p3 ^ zband(ROOF_SEAT, 60)) - holes(PINS_F2_TO_ROOF, ROOF_SEAT)
+    p4 = union([model.print_solids["Garage Gable Roof"]]) - holes(PINS_GARAGE_ROOF, GARAGE_SEAT)
+
+    report = {}
+    for name, piece in (("1_first_floor", p1), ("2_second_floor", p2), ("3_roof_main", p3), ("4_roof_garage", p4)):
+        tabs, n_ears = ears(piece)
+        out = (piece + tabs).to_mesh()
         tm = trimesh.Trimesh(vertices=out.vert_properties[:, :3], faces=out.tri_verts)
         tm.apply_translation([0, 0, -tm.bounds[0][2]])
         tm.apply_scale(s)
-        tm.export(folder / f"{piece}.stl")
-        report[piece] = [round(v, 1) for v in tm.extents] + [skipped]
+        tm.export(folder / f"{name}.stl")
+        report[name] = [round(v, 1) for v in tm.extents] + [n_ears]
+    if skipped:
+        print(f"  ! {len(skipped)} non-solid parts left out of the print pieces")
     return report
 
 
@@ -833,7 +1140,7 @@ def main():
     for n in (1, 2):
         rooms += build_floor(model, floors, n)
     build_cladding(model, floors)
-    build_tower(model)
+    build_tower(model, floors)
     build_front_details(model, floors)
     build_roofs(model, floors)
     build_stairs(model)
@@ -841,6 +1148,7 @@ def main():
     build_baths_and_utility(model)
     build_furniture(model)
     build_site(model)
+    clip_to_roofs(model)
 
     glb = HERE / "house.glb"
     export_glb(model, glb)
@@ -859,7 +1167,7 @@ def main():
     for r in rooms:
         print(f"  F{r['floor']} {r['name']:<24} {r['area_sqft']:>7} sq ft  {r['finish']}")
     for k, v in report.items():
-        print(f"  print/{k}.stl  {v[0]} x {v[1]} x {v[2]} mm at 1:{PRINT_SCALE}" + (f"  ({v[3]} non-solid parts skipped)" if v[3] else ""))
+        print(f"  print/{k}.stl  {v[0]} x {v[1]} x {v[2]} mm at 1:{PRINT_SCALE}, {v[3]} adhesion ears")
 
 
 if __name__ == "__main__":

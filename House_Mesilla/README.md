@@ -14,15 +14,42 @@ floor so you can look inside.
 | `print/1_first_floor.stl` | Slab, first floor walls, cladding, stairs, kitchen. 1:80, mm. |
 | `print/2_second_floor.stl` | Floor framing and second floor walls. Sits on the first floor walls. |
 | `print/3_roof_main.stl` | Main hip, front hip, and the tower gable. Sits on the second floor walls. |
-| `print/4_roof_garage.stl` | Garage gable roof. |
+| `print/4_roof_garage.stl` | Garage gable roof. Sits on the garage walls. |
 | `plan.json` | Walls and plan linework extracted from the PDF, in feet. |
 | `extract_plan.py` | PDF to `plan.json`. |
 | `openings.py` | Finds doors and windows as gaps between wall ends. |
 | `build_house.py` | `plan.json` to everything else. |
 | `viewer_template.html` | Viewer source. `build_house.py` embeds the model into it. |
 
-At 1:80 the footprint is 130 x 208 mm and fits a 220 mm bed. Change `PRINT_SCALE`
-in `build_house.py` for another scale.
+## Printing
+
+Sized for a 220 x 220 mm bed (AnkerMake M5C) at 1:80:
+
+| Piece | Size with adhesion ears (mm) |
+|---|---|
+| 1 first floor | 140 x 218 x 39 |
+| 2 second floor | 140 x 182 x 36 |
+| 3 main roof | 147 x 187 x 36 |
+| 4 garage roof | 90 x 84 x 21 |
+
+- Every piece prints flat side down as exported, with no supports.
+- Guide pins (2.0 mm, 2.5 mm tall, chamfered tip) rise from square posts in
+  the inside corners of each lower piece. They drop into 2.4 mm x 3.0 mm blind
+  holes in the underside of the piece above: four between the floors, four
+  between floor 2 and the main roof, two between the garage walls and the garage
+  roof.
+- Adhesion ears are 10 mm x 0.4 mm discs under the outside corners of each
+  piece's first layer. Snap or trim them off after printing. Turn off the
+  slicer's own brim when using them.
+- Left out of the print pieces: glass, frames, shutters, trim, fixtures,
+  appliances, wall-hung cabinets and furniture.
+- Walls print about 1.5 mm thick. The stair guard upstairs is about 0.7 mm and
+  may need a 0.4 mm nozzle with thin-wall detection on.
+- The first floor piece is 218 mm long with its ears, so keep it square to
+  the bed.
+
+`PRINT_SCALE`, pin, hole and ear sizes are constants at the top of the printing
+section in `build_house.py`.
 
 ## Rebuild
 
@@ -48,7 +75,8 @@ application is needed.
   sheet). Window sills and heads, 6'8" doors and 1 ft floor framing are typical
   builder values, not measured.
 - **Elevation R front:** the builder rendering. Two-story stone entry tower with a
-  front gable, arched porch opening, arched tower window, brick front with
+  front gable whose ridge runs back into the main roof, arched porch opening,
+  small tower window under the gable (into an empty box), brick front with
   shutters and a soldier arch over the study window, brick garage gable with an
   arch over the 16 x 7 raised-panel door, siding on the sides and back
   (front-only masonry), hip roofs.
@@ -65,16 +93,26 @@ application is needed.
   is a guess.
 - **Site:** the survey's lot lines and curve, setbacks, driveway, walk, rear
   concrete porch slab and AC pad.
-- **Furniture layer:** the pieces named in the purchase receipts (sofa set,
-  cocktail tables, oak dining set, charcoal sectional with ottoman). Placement is
-  a guess.
+- **Furniture layer:** the sofa set, cocktail tables and charcoal sectional
+  with ottoman named in the purchase receipts, and a long dining table with ten
+  chairs. Placement and the table's length are estimates.
 
 ## Known gaps
 
+- The stone tower (about 6 ft wide), its small window opening into an empty
+  closed box, the brick entry arch and the stained wood shutters follow the
+  owner's photo. The game room has one front window; the brochure plan draws a
+  second one behind the tower.
 - The survey labels the rear slab "covered conc. porch", but no covered patio
   option is on the selections. It is modeled as an uncovered slab.
 - Fence lines are approximate. The survey only marks fence at the lot lines.
-- Roof pitch is assumed 6/12 for the main roof and garage and 9/12 for the tower.
+  The back gate is in the garage-side fence return; its exact spot is a guess.
+- The documents have no roof plan. The second floor roof is the standard hip
+  roof of the L-shaped footprint: every slope drains to an eave and the one
+  valley runs to the inside corner above the garage. The tower gable ties into
+  the front slope like a dormer. Every wall, skin and trim piece is cut back to
+  the roof surface above it.
+- Roof pitch is assumed 6/12 for the main roof and garage and 5/12 for the tower.
 - The lot is modeled flat; the survey has no spot elevations.
 - Solar panels are not modeled; panel count and layout are not in these documents.
 - Interior doors are openings with headers; there are no door leaves.

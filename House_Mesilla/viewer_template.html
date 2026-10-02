@@ -83,6 +83,7 @@ scene.background = new THREE.Color(0xdfe6ec);
 const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 500);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
+window.viewer = { camera, controls, toWorld };  // handy from the browser console
 scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8170, 1.1));
 const sun = new THREE.DirectionalLight(0xffffff, 1.6);
 sun.position.set(-12, 30, 18);
